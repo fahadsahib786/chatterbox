@@ -288,7 +288,9 @@ class ConditionalCFM(BASECFM):
 class CausalConditionalCFM(ConditionalCFM):
     def __init__(self, in_channels=240, cfm_params=CFM_PARAMS, n_spks=1, spk_emb_dim=80, estimator=None):
         super().__init__(in_channels, cfm_params, n_spks, spk_emb_dim, estimator)
-        self.rand_noise = torch.randn([1, 80, 50 * 300])
+        # CUDA Graph Fix: Initialize as None, will be created on correct device during first forward pass
+        self.rand_noise = None
+        self._noise_shape = [1, 80, 50 * 300]
 
     @torch.inference_mode()
     def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None):
@@ -326,7 +328,11 @@ class CausalConditionalCFM(ConditionalCFM):
         if original_timesteps != n_timesteps:
             logger.info(f"CausalCFM timesteps optimized: {original_timesteps} → {n_timesteps} (fast inference enabled)")
 
-        z = self.rand_noise[:, :, :mu.size(2)].to(mu.device).to(mu.dtype) * temperature
+        # CUDA Graph Fix: Create noise tensor on correct device to avoid CPU->GPU transfer
+        if self.rand_noise is None or self.rand_noise.device != mu.device or self.rand_noise.dtype != mu.dtype:
+            self.rand_noise = torch.randn(self._noise_shape, device=mu.device, dtype=mu.dtype)
+        
+        z = self.rand_noise[:, :, :mu.size(2)] * temperature
         
         # Use DDIM scheduler for better quality with fewer steps
         if self.use_ddim and not self.training:

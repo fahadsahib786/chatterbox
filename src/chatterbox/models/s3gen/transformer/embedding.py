@@ -71,7 +71,9 @@ class PositionalEncoding(torch.nn.Module):
             torch.Tensor: for compatibility to RelPositionalEncoding
         """
 
-        self.pe = self.pe.to(x.device)
+        # CUDA Graph Fix: Avoid device transfer during inference by ensuring pe is on correct device
+        if self.pe.device != x.device or self.pe.dtype != x.dtype:
+            self.pe = self.pe.to(device=x.device, dtype=x.dtype)
         pos_emb = self.position_encoding(offset, x.size(1), False)
         x = x * self.xscale + pos_emb
         return self.dropout(x), self.dropout(pos_emb)
@@ -141,7 +143,9 @@ class RelPositionalEncoding(PositionalEncoding):
             torch.Tensor: Encoded tensor (batch, time, `*`).
             torch.Tensor: Positional embedding tensor (1, time, `*`).
         """
-        self.pe = self.pe.to(x.device)
+        # CUDA Graph Fix: Avoid device transfer during inference by ensuring pe is on correct device
+        if self.pe.device != x.device or self.pe.dtype != x.dtype:
+            self.pe = self.pe.to(device=x.device, dtype=x.dtype)
         x = x * self.xscale
         pos_emb = self.position_encoding(offset, x.size(1), False)
         return self.dropout(x), self.dropout(pos_emb)
@@ -230,14 +234,15 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
                 if self.pe.dtype != x.dtype or self.pe.device != x.device:
                     self.pe = self.pe.to(dtype=x.dtype, device=x.device)
                 return
+        # CUDA Graph Fix: Create tensors directly on target device to avoid CPU->GPU transfers
         # Suppose `i` means to the position of query vecotr and `j` means the
         # position of key vector. We use position relative positions when keys
         # are to the left (i>j) and negative relative positions otherwise (i<j).
-        pe_positive = torch.zeros(x.size(1), self.d_model)
-        pe_negative = torch.zeros(x.size(1), self.d_model)
-        position = torch.arange(0, x.size(1), dtype=torch.float32).unsqueeze(1)
+        pe_positive = torch.zeros(x.size(1), self.d_model, device=x.device, dtype=x.dtype)
+        pe_negative = torch.zeros(x.size(1), self.d_model, device=x.device, dtype=x.dtype)
+        position = torch.arange(0, x.size(1), dtype=x.dtype, device=x.device).unsqueeze(1)
         div_term = torch.exp(
-            torch.arange(0, self.d_model, 2, dtype=torch.float32)
+            torch.arange(0, self.d_model, 2, dtype=x.dtype, device=x.device)
             * -(math.log(10000.0) / self.d_model)
         )
         pe_positive[:, 0::2] = torch.sin(position * div_term)
@@ -251,7 +256,7 @@ class EspnetRelPositionalEncoding(torch.nn.Module):
         pe_positive = torch.flip(pe_positive, [0]).unsqueeze(0)
         pe_negative = pe_negative[1:].unsqueeze(0)
         pe = torch.cat([pe_positive, pe_negative], dim=1)
-        self.pe = pe.to(device=x.device, dtype=x.dtype)
+        self.pe = pe
 
     def forward(self, x: torch.Tensor, offset: Union[int, torch.Tensor] = 0) \
             -> Tuple[torch.Tensor, torch.Tensor]:

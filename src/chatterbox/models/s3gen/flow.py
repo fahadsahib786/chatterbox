@@ -137,7 +137,9 @@ class MaskedDiffWithXvec(torch.nn.Module):
         conds[:, :mel_len1] = prompt_feat
         conds = conds.transpose(1, 2)
 
-        mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        # CUDA Graph Fix: Create tensor directly on target device to avoid CPU->GPU transfer
+        mel_len_total = torch.tensor([mel_len1 + mel_len2], device=h.device, dtype=torch.long)
+        mask = (~make_pad_mask(mel_len_total)).to(h)
         feat, flow_cache = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
@@ -230,7 +232,9 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         conds[:, :mel_len1] = prompt_feat
         conds = conds.transpose(1, 2)
 
-        mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        # CUDA Graph Fix: Create tensor directly on target device to avoid CPU->GPU transfer
+        mel_len_total = torch.tensor([mel_len1 + mel_len2], device=h.device, dtype=torch.long)
+        mask = (~make_pad_mask(mel_len_total)).to(h)
         feat, _ = self.decoder(
             mu=h.transpose(1, 2).contiguous(),
             mask=mask.unsqueeze(1),
