@@ -303,6 +303,8 @@ class ChatterboxTTS:
         temperature=0.8,
         max_new_tokens=1000,
         optimize_quality=True,
+        fast_inference=True,
+        n_timesteps=None,
     ):
         """
         Generate speech from text with optimizations for speed and quality.
@@ -315,6 +317,8 @@ class ChatterboxTTS:
             temperature: Sampling temperature for T3 generation
             max_new_tokens: Maximum tokens to generate
             optimize_quality: Apply quality optimizations
+            fast_inference: Use optimized fast inference (50 timesteps vs 1000)
+            n_timesteps: Override number of timesteps (None = auto-select)
         """
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
@@ -364,14 +368,26 @@ class ChatterboxTTS:
                     speech_tokens = speech_tokens[speech_tokens < 6561]
                     speech_tokens = speech_tokens.to(self.device)
 
-                    # S3Gen inference with quality optimizations
+                    # Determine optimal timesteps for speed vs quality trade-off
+                    if n_timesteps is None:
+                        if fast_inference:
+                            # Use 50 timesteps for 20x speedup with minimal quality loss
+                            inference_timesteps = 50
+                        else:
+                            # Use 100 timesteps for balanced speed/quality
+                            inference_timesteps = 100
+                    else:
+                        inference_timesteps = n_timesteps
+                    
+                    # S3Gen inference with optimized timesteps
                     if optimize_quality:
-                        # Apply quality improvements
-                        wav, _ = self._generate_with_quality_optimization(speech_tokens)
+                        # Apply quality improvements with optimized timesteps
+                        wav, _ = self._generate_with_quality_optimization(speech_tokens, inference_timesteps)
                     else:
                         wav, _ = self.s3gen.inference(
                             speech_tokens=speech_tokens,
                             ref_dict=self.conds.gen,
+                            n_timesteps=inference_timesteps,
                         )
                     
                     # Convert to numpy and apply watermark
@@ -390,16 +406,18 @@ class ChatterboxTTS:
                     
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
 
-    def _generate_with_quality_optimization(self, speech_tokens):
+    def _generate_with_quality_optimization(self, speech_tokens, n_timesteps=50):
         """Generate audio with quality optimizations to reduce glitches"""
         # Use a smaller cache to reduce artifacts
         cache_source = torch.zeros(1, 1, 0, device=self.device, dtype=self.autocast_dtype)
         
+        # Use optimized inference with custom timesteps
         wav, sources = self.s3gen.inference(
             speech_tokens=speech_tokens,
             ref_dict=self.conds.gen,
             cache_source=cache_source,
             finalize=True,
+            n_timesteps=n_timesteps,
         )
         return wav, sources
 

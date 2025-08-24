@@ -515,25 +515,64 @@ class HiFTGenerator(nn.Module):
         
         return generated_speech, s
 
-    def _smooth_f0(self, f0, kernel_size=3):
-        """Apply gentle smoothing to F0 to reduce artifacts"""
+    def _smooth_f0(self, f0, kernel_size=5):
+        """Apply advanced F0 smoothing to reduce robotic artifacts"""
         if kernel_size <= 1:
             return f0
             
-        # Simple moving average filter
+        # Apply median filter first to remove outliers
+        f0_median = self._median_filter_1d(f0, kernel_size=3)
+        
+        # Then apply Gaussian smoothing for natural pitch contours
         padding = kernel_size // 2
-        f0_padded = torch.nn.functional.pad(f0, (padding, padding), mode='replicate')
+        f0_padded = torch.nn.functional.pad(f0_median, (padding, padding), mode='replicate')
         
-        # Create smoothing kernel
-        kernel = torch.ones(1, 1, kernel_size, device=f0.device, dtype=f0.dtype) / kernel_size
+        # Create Gaussian kernel for more natural smoothing
+        sigma = kernel_size / 6.0  # Standard deviation
+        x = torch.arange(kernel_size, device=f0.device, dtype=f0.dtype) - kernel_size // 2
+        gaussian_kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+        gaussian_kernel = gaussian_kernel / gaussian_kernel.sum()
+        gaussian_kernel = gaussian_kernel.view(1, 1, -1)
         
-        # Apply convolution for smoothing
-        f0_smooth = torch.nn.functional.conv1d(f0_padded, kernel, padding=0)
+        # Apply Gaussian smoothing
+        f0_smooth = torch.nn.functional.conv1d(f0_padded, gaussian_kernel, padding=0)
+        
+        # Apply gentle low-pass filter to remove high-frequency noise
+        if f0_smooth.size(-1) > 10:
+            f0_smooth = self._low_pass_filter(f0_smooth, cutoff=0.1)
         
         return f0_smooth
 
+    def _median_filter_1d(self, x, kernel_size=3):
+        """Apply 1D median filter to remove F0 outliers"""
+        if kernel_size <= 1:
+            return x
+            
+        padding = kernel_size // 2
+        x_padded = torch.nn.functional.pad(x, (padding, padding), mode='replicate')
+        
+        # Use unfold to create sliding windows
+        x_unfolded = x_padded.unfold(-1, kernel_size, 1)
+        x_median = torch.median(x_unfolded, dim=-1)[0]
+        
+        return x_median
+
+    def _low_pass_filter(self, x, cutoff=0.1):
+        """Apply simple low-pass filter to reduce high-frequency artifacts"""
+        # Simple exponential moving average filter
+        alpha = cutoff
+        filtered = torch.zeros_like(x)
+        filtered[..., 0] = x[..., 0]
+        
+        for i in range(1, x.size(-1)):
+            filtered[..., i] = alpha * x[..., i] + (1 - alpha) * filtered[..., i-1]
+            
+        return filtered
+
     def _post_process_audio(self, audio):
-        """Apply post-processing to improve audio quality"""
+        """Apply advanced post-processing to improve audio quality and reduce artifacts"""
+        original_audio = audio.clone()
+        
         # Gentle DC removal
         if audio.size(-1) > 1024:  # Only for longer sequences
             # Remove DC component
@@ -550,9 +589,61 @@ class HiFTGenerator(nn.Module):
                     audio_filtered[..., i] = alpha * audio_filtered[..., i-1] + alpha * (audio[..., i] - audio[..., i-1])
                 audio = audio_filtered
         
+        # Advanced artifact reduction
+        audio = self._reduce_glitches(audio)
+        
+        # Dynamic range compression to reduce harsh transitions
+        audio = self._gentle_compression(audio)
+        
         # Gentle limiting to prevent clipping
         max_val = audio.abs().max()
         if max_val > 0.99:
             audio = audio * (0.99 / max_val)
+        
+        # Fallback to original if post-processing made it worse
+        if torch.isnan(audio).any() or torch.isinf(audio).any():
+            audio = original_audio
             
         return audio
+
+    def _reduce_glitches(self, audio, threshold=0.1):
+        """Reduce audio glitches and sudden jumps"""
+        if audio.size(-1) < 3:
+            return audio
+            
+        # Detect sudden jumps in amplitude
+        diff = torch.diff(audio, dim=-1)
+        abs_diff = torch.abs(diff)
+        
+        # Find samples with large jumps
+        mean_diff = abs_diff.mean()
+        std_diff = abs_diff.std()
+        glitch_threshold = mean_diff + 3 * std_diff
+        
+        glitch_mask = abs_diff > glitch_threshold
+        
+        # Smooth out glitches using linear interpolation
+        if glitch_mask.any():
+            audio_smooth = audio.clone()
+            for i in range(1, audio.size(-1) - 1):
+                if glitch_mask[..., i-1]:  # Previous sample had a glitch
+                    # Linear interpolation between neighbors
+                    audio_smooth[..., i] = 0.5 * (audio[..., i-1] + audio[..., i+1])
+            audio = audio_smooth
+            
+        return audio
+
+    def _gentle_compression(self, audio, ratio=0.8, threshold=0.7):
+        """Apply gentle dynamic range compression to reduce harsh transitions"""
+        # Simple soft compression
+        abs_audio = torch.abs(audio)
+        compressed_abs = torch.where(
+            abs_audio > threshold,
+            threshold + (abs_audio - threshold) * ratio,
+            abs_audio
+        )
+        
+        # Preserve sign
+        compressed_audio = torch.sign(audio) * compressed_abs
+        
+        return compressed_audio
