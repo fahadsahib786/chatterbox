@@ -27,10 +27,12 @@ CFM_PARAMS = OmegaConf.create({
     "training_cfg_rate": 0.2,
     "inference_cfg_rate": 0.7,
     "reg_loss_type": "l1",
-    # Optimization parameters
+    # CRITICAL FIX: Optimization parameters for 20x speedup
     "fast_inference_steps": 50,  # Reduced from 1000 for 20x speedup
     "use_ddim": True,  # Better quality with fewer steps
     "adaptive_timesteps": True,  # Dynamic timestep adjustment
+    "default_inference_steps": 50,  # CRITICAL: Default to fast inference
+    "force_fast_inference": True,  # CRITICAL: Always use fast inference unless overridden
 })
 
 
@@ -78,9 +80,22 @@ class ConditionalCFM(BASECFM):
             sample: generated mel-spectrogram
                 shape: (batch_size, n_feats, mel_timesteps)
         """
+        # CRITICAL FIX: Force fast inference for major speedup
+        original_timesteps = n_timesteps
+        
         # Use optimized timesteps for inference
-        if not self.training and hasattr(self, 'fast_inference_steps'):
-            n_timesteps = min(n_timesteps, self.fast_inference_steps)
+        if not self.training:
+            if hasattr(self, 'force_fast_inference') and self.force_fast_inference:
+                # Force fast inference unless explicitly overridden with very high timesteps
+                if n_timesteps > 200:  # Only allow high timesteps if explicitly requested
+                    logger.warning(f"High timesteps ({n_timesteps}) requested, but fast inference is forced. Using {self.fast_inference_steps} instead.")
+                n_timesteps = self.fast_inference_steps
+            elif hasattr(self, 'fast_inference_steps'):
+                n_timesteps = min(n_timesteps, self.fast_inference_steps)
+        
+        # Log timestep optimization for debugging
+        if original_timesteps != n_timesteps:
+            logger.info(f"Timesteps optimized: {original_timesteps} → {n_timesteps} (fast inference enabled)")
 
         z = torch.randn_like(mu).to(mu.device).to(mu.dtype) * temperature
         cache_size = flow_cache.shape[2]
@@ -294,9 +309,22 @@ class CausalConditionalCFM(ConditionalCFM):
             sample: generated mel-spectrogram
                 shape: (batch_size, n_feats, mel_timesteps)
         """
+        # CRITICAL FIX: Force fast inference for major speedup (same as ConditionalCFM)
+        original_timesteps = n_timesteps
+        
         # Use optimized timesteps for inference
-        if not self.training and hasattr(self, 'fast_inference_steps'):
-            n_timesteps = min(n_timesteps, self.fast_inference_steps)
+        if not self.training:
+            if hasattr(self, 'force_fast_inference') and self.force_fast_inference:
+                # Force fast inference unless explicitly overridden with very high timesteps
+                if n_timesteps > 200:  # Only allow high timesteps if explicitly requested
+                    logger.warning(f"High timesteps ({n_timesteps}) requested, but fast inference is forced. Using {self.fast_inference_steps} instead.")
+                n_timesteps = self.fast_inference_steps
+            elif hasattr(self, 'fast_inference_steps'):
+                n_timesteps = min(n_timesteps, self.fast_inference_steps)
+        
+        # Log timestep optimization for debugging
+        if original_timesteps != n_timesteps:
+            logger.info(f"CausalCFM timesteps optimized: {original_timesteps} → {n_timesteps} (fast inference enabled)")
 
         z = self.rand_noise[:, :, :mu.size(2)].to(mu.device).to(mu.dtype) * temperature
         

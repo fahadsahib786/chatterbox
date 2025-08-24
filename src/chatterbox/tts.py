@@ -305,6 +305,12 @@ class ChatterboxTTS:
         optimize_quality=True,
         fast_inference=True,
         n_timesteps=None,
+        # CRITICAL FIX: Add all possible timestep parameter names for compatibility
+        num_steps=None,
+        steps=None,
+        diffusion_steps=None,
+        sampling_steps=None,
+        inference_steps=None,
     ):
         """
         Generate speech from text with optimizations for speed and quality.
@@ -319,6 +325,11 @@ class ChatterboxTTS:
             optimize_quality: Apply quality optimizations
             fast_inference: Use optimized fast inference (50 timesteps vs 1000)
             n_timesteps: Override number of timesteps (None = auto-select)
+            num_steps: Alternative name for n_timesteps (compatibility)
+            steps: Alternative name for n_timesteps (compatibility)
+            diffusion_steps: Alternative name for n_timesteps (compatibility)
+            sampling_steps: Alternative name for n_timesteps (compatibility)
+            inference_steps: Alternative name for n_timesteps (compatibility)
         """
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
@@ -368,16 +379,27 @@ class ChatterboxTTS:
                     speech_tokens = speech_tokens[speech_tokens < 6561]
                     speech_tokens = speech_tokens.to(self.device)
 
-                    # Determine optimal timesteps for speed vs quality trade-off
-                    if n_timesteps is None:
+                    # CRITICAL FIX: Determine optimal timesteps with compatibility for all parameter names
+                    inference_timesteps = None
+                    
+                    # Check all possible timestep parameter names (in order of preference)
+                    timestep_params = [n_timesteps, num_steps, steps, diffusion_steps, sampling_steps, inference_steps]
+                    for param in timestep_params:
+                        if param is not None:
+                            inference_timesteps = param
+                            break
+                    
+                    # If no timestep parameter provided, use defaults based on fast_inference
+                    if inference_timesteps is None:
                         if fast_inference:
                             # Use 50 timesteps for 20x speedup with minimal quality loss
                             inference_timesteps = 50
                         else:
                             # Use 100 timesteps for balanced speed/quality
                             inference_timesteps = 100
-                    else:
-                        inference_timesteps = n_timesteps
+                    
+                    # CRITICAL FIX: Log the timesteps being used for debugging
+                    logger.info(f"Using {inference_timesteps} timesteps for synthesis (fast_inference={fast_inference})")
                     
                     # S3Gen inference with optimized timesteps
                     if optimize_quality:
