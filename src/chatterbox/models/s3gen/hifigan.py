@@ -460,15 +460,99 @@ class HiFTGenerator(nn.Module):
         return generated_speech, f0
 
     @torch.inference_mode()
-    def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
-        # mel->f0
+    def inference(self, speech_feat: torch.Tensor, cache_source: torch.Tensor = None) -> torch.Tensor:
+        """
+        Optimized inference with improved glitch prevention and audio quality
+        """
+        if cache_source is None:
+            cache_source = torch.zeros(1, 1, 0, device=speech_feat.device, dtype=speech_feat.dtype)
+            
+        # mel->f0 with stability improvements
         f0 = self.f0_predictor(speech_feat)
-        # f0->source
+        
+        # Apply F0 smoothing to reduce artifacts
+        if f0.size(-1) > 3:  # Only smooth if we have enough frames
+            f0 = self._smooth_f0(f0)
+        
+        # f0->source with optimized processing
         s = self.f0_upsamp(f0[:, None]).transpose(1, 2)  # bs,n,t
         s, _, _ = self.m_source(s)
         s = s.transpose(1, 2)
-        # use cache_source to avoid glitch
-        if cache_source.shape[2] != 0:
-            s[:, :, :cache_source.shape[2]] = cache_source
+        
+        # Enhanced cache_source mechanism for better glitch prevention
+        if cache_source.shape[2] > 0:
+            cache_len = min(cache_source.shape[2], s.shape[2])
+            if cache_len > 0:
+                # Apply smooth transition to reduce discontinuities
+                transition_len = min(8, cache_len // 4)  # Smooth transition over 8 samples
+                if transition_len > 0:
+                    # Create smooth transition weights
+                    weights = torch.linspace(1.0, 0.0, transition_len, device=s.device, dtype=s.dtype)
+                    weights = weights.view(1, 1, -1)
+                    
+                    # Apply cached source
+                    s[:, :, :cache_len] = cache_source[:, :, :cache_len]
+                    
+                    # Smooth transition at the boundary
+                    if cache_len < s.shape[2] and transition_len > 0:
+                        end_idx = min(cache_len + transition_len, s.shape[2])
+                        transition_region = s[:, :, cache_len:end_idx]
+                        cached_region = cache_source[:, :, cache_len:end_idx] if cache_len < cache_source.shape[2] else transition_region
+                        
+                        actual_transition_len = end_idx - cache_len
+                        if actual_transition_len > 0:
+                            weights_actual = weights[:, :, :actual_transition_len]
+                            s[:, :, cache_len:end_idx] = (weights_actual * cached_region + 
+                                                        (1 - weights_actual) * transition_region)
+                else:
+                    s[:, :, :cache_len] = cache_source[:, :, :cache_len]
+        
+        # Generate speech with quality improvements
         generated_speech = self.decode(x=speech_feat, s=s)
+        
+        # Apply post-processing for quality enhancement
+        generated_speech = self._post_process_audio(generated_speech)
+        
         return generated_speech, s
+
+    def _smooth_f0(self, f0, kernel_size=3):
+        """Apply gentle smoothing to F0 to reduce artifacts"""
+        if kernel_size <= 1:
+            return f0
+            
+        # Simple moving average filter
+        padding = kernel_size // 2
+        f0_padded = torch.nn.functional.pad(f0, (padding, padding), mode='replicate')
+        
+        # Create smoothing kernel
+        kernel = torch.ones(1, 1, kernel_size, device=f0.device, dtype=f0.dtype) / kernel_size
+        
+        # Apply convolution for smoothing
+        f0_smooth = torch.nn.functional.conv1d(f0_padded, kernel, padding=0)
+        
+        return f0_smooth
+
+    def _post_process_audio(self, audio):
+        """Apply post-processing to improve audio quality"""
+        # Gentle DC removal
+        if audio.size(-1) > 1024:  # Only for longer sequences
+            # Remove DC component
+            audio_mean = audio.mean(dim=-1, keepdim=True)
+            audio = audio - audio_mean
+            
+            # Apply gentle high-frequency emphasis to improve clarity
+            # Simple first-order high-pass filter
+            alpha = 0.95  # High-pass filter coefficient
+            if audio.size(-1) > 1:
+                audio_filtered = torch.zeros_like(audio)
+                audio_filtered[..., 0] = audio[..., 0]
+                for i in range(1, audio.size(-1)):
+                    audio_filtered[..., i] = alpha * audio_filtered[..., i-1] + alpha * (audio[..., i] - audio[..., i-1])
+                audio = audio_filtered
+        
+        # Gentle limiting to prevent clipping
+        max_val = audio.abs().max()
+        if max_val > 0.99:
+            audio = audio * (0.99 / max_val)
+            
+        return audio

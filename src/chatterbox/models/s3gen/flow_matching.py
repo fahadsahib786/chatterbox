@@ -11,11 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import threading
 import torch
 import torch.nn.functional as F
 from .matcha.flow_matching import BASECFM
 from omegaconf import OmegaConf
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 CFM_PARAMS = OmegaConf.create({
@@ -42,7 +44,10 @@ class ConditionalCFM(BASECFM):
         in_channels = in_channels + (spk_emb_dim if n_spks > 0 else 0)
         # Just change the architecture of the estimator here
         self.estimator = estimator
-        self.lock = threading.Lock()
+        
+        # Pre-allocate tensors for better performance
+        self._preallocated_tensors = {}
+        self._device = None
 
     @torch.inference_mode()
     def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, prompt_len=0, flow_cache=torch.zeros(1, 80, 0, 2)):
@@ -79,9 +84,23 @@ class ConditionalCFM(BASECFM):
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
         return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), flow_cache
 
+    def _get_preallocated_tensors(self, x, device, dtype):
+        """Get or create pre-allocated tensors for efficient CFG processing"""
+        key = (x.size(2), device, dtype)
+        if key not in self._preallocated_tensors:
+            self._preallocated_tensors[key] = {
+                'x_in': torch.zeros([2, 80, x.size(2)], device=device, dtype=dtype),
+                'mask_in': torch.zeros([2, 1, x.size(2)], device=device, dtype=dtype),
+                'mu_in': torch.zeros([2, 80, x.size(2)], device=device, dtype=dtype),
+                't_in': torch.zeros([2], device=device, dtype=dtype),
+                'spks_in': torch.zeros([2, 80], device=device, dtype=dtype),
+                'cond_in': torch.zeros([2, 80, x.size(2)], device=device, dtype=dtype),
+            }
+        return self._preallocated_tensors[key]
+
     def solve_euler(self, x, t_span, mu, mask, spks, cond):
         """
-        Fixed euler solver for ODEs.
+        Optimized euler solver for ODEs with pre-allocated tensors and reduced memory operations.
         Args:
             x (torch.Tensor): random noise
             t_span (torch.Tensor): n_timesteps interpolated
@@ -97,61 +116,87 @@ class ConditionalCFM(BASECFM):
         t, _, dt = t_span[0], t_span[-1], t_span[1] - t_span[0]
         t = t.unsqueeze(dim=0)
 
-        # I am storing this because I can later plot it by putting a debugger here and saving it to a file
-        # Or in future might add like a return_all_steps flag
-        sol = []
+        # Get pre-allocated tensors for efficiency
+        tensors = self._get_preallocated_tensors(x, x.device, x.dtype)
+        x_in = tensors['x_in']
+        mask_in = tensors['mask_in']
+        mu_in = tensors['mu_in']
+        t_in = tensors['t_in']
+        spks_in = tensors['spks_in']
+        cond_in = tensors['cond_in']
 
-        # Do not use concat, it may cause memory format changed and trt infer with wrong results!
-        x_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
-        mask_in = torch.zeros([2, 1, x.size(2)], device=x.device, dtype=x.dtype)
-        mu_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
-        t_in = torch.zeros([2], device=x.device, dtype=x.dtype)
-        spks_in = torch.zeros([2, 80], device=x.device, dtype=x.dtype)
-        cond_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
+        # Pre-fill constant values to avoid repeated operations
+        mask_in[0] = mask
+        mask_in[1] = mask
+        mu_in[1].zero_()  # Unconditional branch
+        spks_in[1].zero_()  # Unconditional branch
+        cond_in[1].zero_()  # Unconditional branch
+
         for step in range(1, len(t_span)):
-            # Classifier-Free Guidance inference introduced in VoiceBox
-            x_in[:] = x
-            mask_in[:] = mask
+            # Classifier-Free Guidance inference - optimized version
+            x_in[0] = x
+            x_in[1] = x
             mu_in[0] = mu
-            t_in[:] = t.unsqueeze(0)
+            t_in.fill_(t.item())
             spks_in[0] = spks
             cond_in[0] = cond
+            
             dphi_dt = self.forward_estimator(
                 x_in, mask_in,
                 mu_in, t_in,
                 spks_in,
                 cond_in
             )
-            dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
-            dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt)
+            
+            # Optimized CFG computation
+            dphi_dt_cond = dphi_dt[0:1]
+            dphi_dt_uncond = dphi_dt[1:2]
+            dphi_dt = dphi_dt_cond + self.inference_cfg_rate * (dphi_dt_cond - dphi_dt_uncond)
+            
+            # Update x and t
             x = x + dt * dphi_dt
             t = t + dt
-            sol.append(x)
+            
+            # Update dt for next step
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t
 
-        return sol[-1].float()
+        return x.float()
 
     def forward_estimator(self, x, mask, mu, t, spks, cond):
+        """Optimized forward estimator without threading locks"""
         if isinstance(self.estimator, torch.nn.Module):
             return self.estimator.forward(x, mask, mu, t, spks, cond)
         else:
-            with self.lock:
-                self.estimator.set_input_shape('x', (2, 80, x.size(2)))
-                self.estimator.set_input_shape('mask', (2, 1, x.size(2)))
-                self.estimator.set_input_shape('mu', (2, 80, x.size(2)))
-                self.estimator.set_input_shape('t', (2,))
-                self.estimator.set_input_shape('spks', (2, 80))
-                self.estimator.set_input_shape('cond', (2, 80, x.size(2)))
-                # run trt engine
-                self.estimator.execute_v2([x.contiguous().data_ptr(),
-                                           mask.contiguous().data_ptr(),
-                                           mu.contiguous().data_ptr(),
-                                           t.contiguous().data_ptr(),
-                                           spks.contiguous().data_ptr(),
-                                           cond.contiguous().data_ptr(),
-                                           x.data_ptr()])
-            return x
+            # TensorRT engine path - removed threading lock for better performance
+            try:
+                # Set input shapes (cached for repeated calls)
+                seq_len = x.size(2)
+                if not hasattr(self, '_trt_shapes_set') or self._last_seq_len != seq_len:
+                    self.estimator.set_input_shape('x', (2, 80, seq_len))
+                    self.estimator.set_input_shape('mask', (2, 1, seq_len))
+                    self.estimator.set_input_shape('mu', (2, 80, seq_len))
+                    self.estimator.set_input_shape('t', (2,))
+                    self.estimator.set_input_shape('spks', (2, 80))
+                    self.estimator.set_input_shape('cond', (2, 80, seq_len))
+                    self._trt_shapes_set = True
+                    self._last_seq_len = seq_len
+                
+                # Execute TensorRT engine
+                self.estimator.execute_v2([
+                    x.contiguous().data_ptr(),
+                    mask.contiguous().data_ptr(),
+                    mu.contiguous().data_ptr(),
+                    t.contiguous().data_ptr(),
+                    spks.contiguous().data_ptr(),
+                    cond.contiguous().data_ptr(),
+                    x.data_ptr()
+                ])
+                return x
+            except Exception as e:
+                logger.warning(f"TensorRT execution failed: {e}, falling back to PyTorch")
+                # Fallback to PyTorch if TensorRT fails
+                return self.estimator.forward(x, mask, mu, t, spks, cond)
 
     def compute_loss(self, x1, mask, mu, spks=None, cond=None):
         """Computes diffusion loss
