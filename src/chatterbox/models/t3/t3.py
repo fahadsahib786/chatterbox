@@ -148,15 +148,21 @@ class T3(nn.Module):
         len_speech = speech_tokens.size(1)
         B, _, dim = hidden_states.shape
         device, dtype = hidden_states.device, hidden_states.dtype
-        text_latents = torch.zeros(B, len_text, dim, dtype=dtype, device=device)
-        speech_latents = torch.zeros(B, len_speech, dim, dtype=dtype, device=device)
         ttl, stl = text_token_lens, speech_token_lens
-        for i in range(B):
-            text_end = len_cond + ttl[i].item()
-            speech_start = len_cond + text_tokens.size(1)
-            speech_end = speech_start + stl[i].item()
-            text_latents[i, :ttl[i]] = hidden_states[i, len_cond:text_end]
-            speech_latents[i, :stl[i]] = hidden_states[i, speech_start:speech_end]
+
+        # Vectorized extraction without .item() to avoid graph breaks and improve speed
+        # Slice text and speech portions for all batch elements at once
+        text_hidden = hidden_states[:, len_cond:len_cond + len_text, :]  # (B, Lt, D)
+        speech_start = len_cond + len_text
+        speech_hidden = hidden_states[:, speech_start:speech_start + len_speech, :]  # (B, Ls, D)
+
+        # Build boolean masks per example for valid token positions
+        text_mask = torch.arange(len_text, device=device).unsqueeze(0) < ttl.unsqueeze(1)     # (B, Lt)
+        speech_mask = torch.arange(len_speech, device=device).unsqueeze(0) < stl.unsqueeze(1) # (B, Ls)
+
+        # Apply masks to zero-out padded positions
+        text_latents = torch.where(text_mask.unsqueeze(-1), text_hidden, torch.zeros_like(text_hidden))
+        speech_latents = torch.where(speech_mask.unsqueeze(-1), speech_hidden, torch.zeros_like(speech_hidden))
 
         # logit projection
         text_logits = self.text_head(text_latents)

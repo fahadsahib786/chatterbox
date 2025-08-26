@@ -176,7 +176,9 @@ class ConditionalCFM(BASECFM):
                 x_in[0] = x
                 x_in[1] = x
                 mu_in[0] = mu
-                t_in.fill_(t.item())
+                # CRITICAL FIX: Avoid .item() call that breaks CUDA graph compilation
+                # Use tensor operations to fill instead of scalar conversion
+                t_in.fill_(t.squeeze())
                 spks_in[0] = spks
                 cond_in[0] = cond
                 

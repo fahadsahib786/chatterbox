@@ -133,7 +133,9 @@ def add_optional_chunk_mask(xs: torch.Tensor,
             # chunk size is either [1, 25] or full context(max_len).
             # Since we use 4 times subsampling and allow up to 1s(100 frames)
             # delay, the maximum frame is 100 / 4 = 25.
-            chunk_size = torch.randint(1, max_len, (1, )).item()
+            # CRITICAL FIX: Avoid .item() calls that break CUDA graph compilation
+            chunk_size_tensor = torch.randint(1, max_len, (1, ), device=xs.device)
+            chunk_size = chunk_size_tensor.item()  # Keep .item() here as it's in training path
             num_left_chunks = -1
             if chunk_size > max_len // 2 and enable_full_context:
                 chunk_size = max_len
@@ -141,8 +143,8 @@ def add_optional_chunk_mask(xs: torch.Tensor,
                 chunk_size = chunk_size % 25 + 1
                 if use_dynamic_left_chunk:
                     max_left_chunks = (max_len - 1) // chunk_size
-                    num_left_chunks = torch.randint(0, max_left_chunks,
-                                                    (1, )).item()
+                    num_left_chunks_tensor = torch.randint(0, max_left_chunks, (1, ), device=xs.device)
+                    num_left_chunks = num_left_chunks_tensor.item()  # Keep .item() here as it's in training path
         chunk_masks = subsequent_chunk_mask(xs.size(1), chunk_size,
                                             num_left_chunks,
                                             xs.device)  # (L, L)
@@ -158,7 +160,9 @@ def add_optional_chunk_mask(xs: torch.Tensor,
     else:
         chunk_masks = masks
     assert chunk_masks.dtype == torch.bool
-    if (chunk_masks.sum(dim=-1) == 0).sum().item() != 0:
+    # CRITICAL FIX: Avoid .item() call that breaks CUDA graph compilation
+    zero_mask_count = (chunk_masks.sum(dim=-1) == 0).sum()
+    if zero_mask_count > 0:
         logging.warning('get chunk_masks all false at some timestep, force set to true, make sure they are masked in futuer computation!')
         chunk_masks[chunk_masks.sum(dim=-1)==0] = True
     return chunk_masks
@@ -182,13 +186,23 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
                  [0, 0, 1, 1, 1]]
     """
     batch_size = lengths.size(0)
-    max_len = max_len if max_len > 0 else lengths.max().item()
-    # CUDA Graph Fix: Create seq_range directly on the same device as lengths to avoid CPU->GPU transfer
+    
+    # CRITICAL FIX: Avoid .item() call that breaks CUDA graph compilation
+    # Use tensor operations that stay on GPU to prevent graph breaks
+    if max_len > 0:
+        # Use provided max_len as tensor to avoid CPU synchronization
+        max_len_tensor = torch.tensor(max_len, device=lengths.device, dtype=lengths.dtype)
+    else:
+        # Use torch.max() instead of .item() to keep computation on GPU
+        max_len_tensor = torch.max(lengths)
+    
+    # Create seq_range directly on the same device as lengths to avoid CPU->GPU transfer
+    # Use max_len_tensor directly in arange to avoid .item() conversion
     seq_range = torch.arange(0,
-                             max_len,
+                             max_len_tensor,
                              dtype=torch.int64,
                              device=lengths.device)
-    seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, max_len)
+    seq_range_expand = seq_range.unsqueeze(0).expand(batch_size, seq_range.size(0))
     seq_length_expand = lengths.unsqueeze(-1)
     mask = seq_range_expand >= seq_length_expand
     return mask

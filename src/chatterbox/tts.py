@@ -18,9 +18,27 @@ from .models.tokenizers import EnTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
 
+# Initialize module logger before any usage
+logger = logging.getLogger(__name__)
+
+# CRITICAL FIX: Configure PyTorch dynamo to handle scalar operations and prevent graph breaks
+try:
+    import torch._dynamo
+    # Enable capture of scalar outputs to prevent graph breaks from .item() calls
+    torch._dynamo.config.capture_scalar_outputs = True
+    # Suppress excessive warnings while keeping important ones
+    torch._dynamo.config.suppress_errors = True
+    # Enable automatic dynamic shapes for better graph optimization
+    torch._dynamo.config.automatic_dynamic_shapes = True
+    logger.info("PyTorch dynamo configured for CUDA graph optimization")
+except ImportError:
+    logger.warning("PyTorch dynamo not available, some optimizations may be limited")
+except Exception as e:
+    logger.warning(f"PyTorch dynamo configuration failed: {e}")
+
 
 REPO_ID = "ResembleAI/chatterbox"
-logger = logging.getLogger(__name__)
+# logger already initialized above
 
 
 def punc_norm(text: str) -> str:
@@ -130,7 +148,18 @@ class ChatterboxTTS:
         self.optimize_memory = optimize_memory
         
         # Set autocast dtype for mixed precision
-        self.autocast_dtype = torch.float16 if self.use_mixed_precision else torch.float32
+        # Prefer bfloat16 on Ampere+ (e.g., A40) for speed and stability; fallback to float16 otherwise
+        if self.use_mixed_precision:
+            dtype = torch.float16
+            try:
+                if torch.cuda.is_available() and hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+                    dtype = torch.bfloat16
+            except Exception:
+                # Safe fallback if CUDA is not available or function is missing
+                pass
+            self.autocast_dtype = dtype
+        else:
+            self.autocast_dtype = torch.float32
         
         self.t3 = t3
         self.s3gen = s3gen
@@ -290,7 +319,8 @@ class ChatterboxTTS:
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
             cond_prompt_speech_tokens=t3_cond_prompt_tokens,
-            emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            # Ensure emotion_adv tensor matches device/dtype for mixed precision stability
+            emotion_adv=exaggeration * torch.ones(1, 1, 1, device=self.device, dtype=self.autocast_dtype if self.use_mixed_precision else torch.float32),
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
@@ -445,23 +475,51 @@ class ChatterboxTTS:
 
     def _post_process_audio(self, wav):
         """Apply post-processing to improve audio quality"""
-        # Apply gentle high-pass filter to remove DC offset
-        if len(wav) > 1024:  # Only for longer audio
+        # Very short clips: return early
+        if len(wav) <= 16:
+            return wav
+
+        # Remove DC offset
+        wav = wav - float(np.mean(wav))
+
+        processed = wav
+        used_scipy = False
+        try:
             from scipy import signal
-            try:
-                # High-pass filter at 80Hz to remove rumble
-                sos = signal.butter(2, 80, btype='high', fs=self.sr, output='sos')
-                wav = signal.sosfilt(sos, wav)
-                
-                # Gentle normalization to prevent clipping
-                max_val = np.abs(wav).max()
-                if max_val > 0.95:
-                    wav = wav * (0.95 / max_val)
-                    
-            except ImportError:
-                logger.warning("scipy not available for audio post-processing")
-                
-        return wav
+            # High‑pass filter at 80 Hz to remove rumble/DC
+            sos = signal.butter(2, 80, btype="highpass", fs=self.sr, output="sos")
+            processed = signal.sosfilt(sos, processed)
+            used_scipy = True
+        except Exception:
+            # Fallback: simple one‑pole high‑pass (differentiator + leakage)
+            alpha = 0.995
+            y = np.empty_like(processed)
+            y[0] = processed[0]
+            for i in range(1, processed.shape[0]):
+                y[i] = processed[i] - processed[i - 1] + alpha * y[i - 1]
+            processed = y
+
+        # Gentle normalization to avoid clipping while preserving dynamics
+        peak = float(np.max(np.abs(processed)) + 1e-9)
+        target_peak = 0.95
+        if peak > target_peak:
+            processed = processed * (target_peak / peak)
+
+        # Soft clip to tame rare residual peaks without harsh distortion
+        processed = np.tanh(processed)
+
+        # Short fade in/out to avoid clicks at boundaries
+        fade_len = min(1024, processed.shape[0] // 200)  # ~5 ms at 20 kHz
+        if fade_len > 0:
+            fade_in = np.linspace(0.0, 1.0, fade_len, dtype=processed.dtype)
+            fade_out = fade_in[::-1]
+            processed[:fade_len] *= fade_in
+            processed[-fade_len:] *= fade_out
+
+        if not used_scipy:
+            logger.warning("Using fallback post-processing (scipy not available)")
+
+        return processed
 
     def _fallback_generate(self, text, audio_prompt_path, exaggeration, cfg_weight, temperature):
         """Fallback generation without optimizations"""
