@@ -35,7 +35,25 @@ class ChatterboxVC:
         self.compile_models = compile_models and device != "cpu"
         self.optimize_quality = optimize_quality
         
-        # Set autocast dtype for mixed precision
+        # Validate device and available features before applying optimizations.
+        # If a CUDA device was requested but no CUDA runtime is available, gracefully fall back to CPU.
+        if "cuda" in self.device and not torch.cuda.is_available():
+            logger.warning(f"Requested CUDA device {self.device} but CUDA is unavailable. Falling back to CPU.")
+            self.device = "cpu"
+        # Similarly, fall back if an MPS device was requested and is not available.
+        if "mps" in self.device and hasattr(torch.backends, "mps") and not torch.backends.mps.is_available():
+            logger.warning("MPS device requested but not available; falling back to CPU.")
+            self.device = "cpu"
+        # Disable model compilation if torch.compile is not present (e.g. on older PyTorch versions).
+        if self.compile_models and not hasattr(torch, "compile"):
+            logger.warning("torch.compile not available in this PyTorch build; disabling model compilation.")
+            self.compile_models = False
+        # Mixed precision requires a CUDA or MPS device; disable it on CPU.
+        if self.use_mixed_precision and self.device == "cpu":
+            logger.warning("Mixed precision requires a CUDA or MPS device; disabling mixed precision.")
+            self.use_mixed_precision = False
+
+        # Set autocast dtype for mixed precision (float16) or full precision (float32)
         self.autocast_dtype = torch.float16 if self.use_mixed_precision else torch.float32
         
         self.s3gen = s3gen
@@ -162,7 +180,12 @@ class ChatterboxVC:
         if target_voice_path:
             self.set_target_voice(target_voice_path)
         else:
-            assert self.ref_dict is not None, "Please `prepare_conditionals` first or specify `target_voice_path`"
+            # Provide a clearer error message when no voice reference has been set.
+            if self.ref_dict is None:
+                raise RuntimeError(
+                    "No target voice reference provided. Call `set_target_voice` with a reference sample "
+                    "or specify `target_voice_path` before calling generate()."
+                )
 
         # Use instance setting if not overridden
         if optimize_quality is None:
@@ -175,13 +198,16 @@ class ChatterboxVC:
                     # Load and preprocess audio with quality improvements
                     if isinstance(audio, str):
                         audio_16, _ = librosa.load(audio, sr=S3_SR)
-                        # Apply gentle pre-processing
                         if optimize_quality:
                             audio_16 = self._preprocess_audio(audio_16)
-                    else:
+                    elif isinstance(audio, np.ndarray):
                         audio_16 = audio
-                        
-                    audio_16 = torch.from_numpy(audio_16).float().to(self.device)[None, ]
+                    elif torch.is_tensor(audio):
+                        audio_16 = audio.detach().cpu().numpy()
+                    else:
+                        raise TypeError("Unsupported audio type; expected file path, numpy array, or torch tensor.")
+                    
+                    audio_16 = torch.from_numpy(np.asarray(audio_16, dtype=np.float32)).to(self.device)[None, ]
 
                     # Tokenize audio
                     s3_tokens, _ = self.s3gen.tokenizer(audio_16)
