@@ -146,7 +146,21 @@ class ChatterboxTTS:
         self.use_mixed_precision = use_mixed_precision and device != "cpu"
         self.compile_models = compile_models and device != "cpu"
         self.optimize_memory = optimize_memory
-        
+
+        # Validate device and available features.
+        if "cuda" in self.device and not torch.cuda.is_available():
+            logger.warning(f"Requested CUDA device {self.device} but CUDA is unavailable. Falling back to CPU.")
+            self.device = "cpu"
+        if "mps" in self.device and hasattr(torch.backends, "mps") and not torch.backends.mps.is_available():
+            logger.warning("MPS device requested but not available; falling back to CPU.")
+            self.device = "cpu"
+        if self.compile_models and not hasattr(torch, "compile"):
+            logger.warning("torch.compile not available in this PyTorch build; disabling model compilation.")
+            self.compile_models = False
+        if self.use_mixed_precision and self.device == "cpu":
+            logger.warning("Mixed precision requires a CUDA or MPS device; disabling mixed precision.")
+            self.use_mixed_precision = False
+         
         # Set autocast dtype for mixed precision
         # Prefer bfloat16 on Ampere+ (e.g., A40) for speed and stability; fallback to float16 otherwise
         if self.use_mixed_precision:
